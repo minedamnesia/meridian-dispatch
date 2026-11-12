@@ -1,0 +1,75 @@
+name: Meridian Dispatch Daily
+on:
+  schedule:
+    - cron: '0 6 * * *'
+      timezone: 'America/Los_Angeles'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Preview only: do not send email or mark articles seen'
+        type: boolean
+        default: true
+permissions:
+  contents: write
+concurrency:
+  group: meridian-dispatch-daily
+  cancel-in-progress: false
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PYTHONUNBUFFERED: '1'
+      MERIDIAN_DATA_DIR: ./data
+      SMTP_HOST: smtp.gmail.com
+      SMTP_PORT: '587'
+      SMTP_SSL: 'false'
+      SMTP_USER: ${{ secrets.SMTP_USER }}
+      SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+      EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+      EMAIL_TO: ${{ secrets.EMAIL_TO }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Validate
+        run: python -m unittest discover -s tests -v
+      - name: Collect and deliver
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == 'workflow_dispatch' && "${{ inputs.dry_run }}" == 'true' ]]; then
+            python -m meridian_dispatch.main --data-dir ./data --days 3 --max-items 10 --dry-run
+          else
+            for var in SMTP_USER SMTP_PASSWORD EMAIL_FROM EMAIL_TO; do
+              if [[ -z "${!var:-}" ]]; then echo "Missing required GitHub Actions secret: $var" >&2; exit 1; fi
+            done
+            python -m meridian_dispatch.main --data-dir ./data --days 3 --max-items 10 --send-email
+          fi
+      - name: Upload digest artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: meridian-dispatch-${{ github.run_id }}
+          path: data/reports/
+          if-no-files-found: ignore
+          retention-days: 30
+      - name: Persist deduplication history
+        if: success() && (github.event_name == 'schedule' || inputs.dry_run == false)
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add data/articles.sqlite3
+          if git diff --cached --quiet; then
+            echo 'No new articles to persist'
+            exit 0
+          fi
+          git commit -m 'chore: update Meridian Dispatch seen-article history [skip ci]'
+          git push
